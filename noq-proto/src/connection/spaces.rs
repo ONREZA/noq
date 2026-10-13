@@ -98,7 +98,8 @@ impl PacketSpace {
         &mut self,
         path_id: PathId,
         request_immediate_ack: bool,
-        streams: &StreamsState,
+        stream_retransmit_paths: &[PathId],
+        streams: &mut StreamsState,
     ) {
         if request_immediate_ack {
             // The probe should be ACKed without delay (should only be used in the Data space and
@@ -113,12 +114,27 @@ impl PacketSpace {
         }
 
         // Retransmit data from the oldest in-flight data from any path
-        for packet in self
-            .number_spaces
-            .values_mut()
-            .flat_map(|s| s.sent_packets.values_mut())
+        for (original_path, packet) in
+            self.number_spaces
+                .iter_mut()
+                .flat_map(|(&original_path, s)| {
+                    s.sent_packets
+                        .values_mut()
+                        .map(move |packet| (original_path, packet))
+                })
         {
-            if !packet.retransmits.is_empty(streams) {
+            let retransmit_streams = stream_retransmit_paths.contains(&original_path);
+            if !packet.retransmits.is_empty(streams)
+                || (retransmit_streams && !packet.stream_frames.is_empty())
+            {
+                // STREAM metadata is separate from other retransmittable frames.
+                // Transfer its custody too, so a surviving path can resend bytes
+                // without waiting for an ACK on the failed path.
+                if retransmit_streams {
+                    for frame in mem::take(&mut packet.stream_frames) {
+                        streams.retransmit(frame);
+                    }
+                }
                 // Remove retransmitted data from the old packet so we don't end up retransmitting
                 // it *again* even if the copy we're sending now gets acknowledged.
                 self.pending |= mem::take(&mut packet.retransmits);

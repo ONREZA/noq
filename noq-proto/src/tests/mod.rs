@@ -2900,6 +2900,63 @@ fn malformed_token_len() {
 }
 
 #[test]
+fn path_stats_report_unacknowledged_probes_and_recovery() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let payload = [42; 1024];
+    pair.client_send(client_ch, stream).write(&payload).unwrap();
+    pair.client_send(client_ch, stream).finish().unwrap();
+
+    let deadline = pair.time + Duration::from_secs(5);
+    while pair.time < deadline {
+        if pair
+            .client_conn_mut(client_ch)
+            .path_stats(PathId::ZERO)
+            .unwrap()
+            .pto_count
+            >= 3
+        {
+            break;
+        }
+        assert!(
+            pair.blackhole_step(true, true),
+            "probes stopped before detecting loss"
+        );
+    }
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .path_stats(PathId::ZERO)
+            .unwrap()
+            .pto_count
+            >= 3
+    );
+
+    // Recover the same Connection, retransmitting bytes queued before the loss.
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .path_stats(PathId::ZERO)
+            .unwrap()
+            .pto_count,
+        0
+    );
+    assert_eq!(
+        pair.server_streams(server_ch).accept(Dir::Uni),
+        Some(stream)
+    );
+    let mut received = Vec::new();
+    let mut recv = pair.server_recv(server_ch, stream);
+    let mut chunks = recv.read(false).unwrap();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, payload);
+}
+
+#[test]
 fn loss_probe_requests_immediate_ack() {
     let _guard = subscribe();
     let mut pair = Pair::default();

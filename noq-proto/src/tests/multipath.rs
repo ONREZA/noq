@@ -2293,3 +2293,159 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// Backup control remains responsive without bypassing application path selection.
+#[test]
+fn backup_probes_are_acknowledged_without_promoting_application_data() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let original_client = pair.routes.as_basic().client_addr;
+    let original_server = pair.routes.as_basic().server_addr;
+    let backup_client: SocketAddr = "[::3]:4444".parse()?;
+    let backup_server: SocketAddr = "[::4]:5555".parse()?;
+    pair.routes = ManyToManyRouting::simple_symmetric(
+        [original_client, backup_client],
+        [original_server, backup_server],
+    )
+    .into();
+    let backup = pair.open_path(
+        Client,
+        FourTuple {
+            local_ip: Some(backup_client.ip()),
+            remote: backup_server,
+        },
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+    pair.set_path_status(Server, backup, PathStatus::Backup)?;
+    pair.drive();
+    let client_before = pair.path_stats(Client, backup).unwrap();
+    let server_before = pair.path_stats(Server, backup).unwrap();
+
+    // The selected physical route fails, while both peers keep the validated public backup.
+    pair.routes = ManyToManyRouting::simple_symmetric([backup_client], [backup_server]).into();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .write(b"selected path only")?;
+    pair.ping_path(Client, backup)?;
+    pair.ping_path(Server, backup)?;
+    let deadline = pair.time + Duration::from_secs(5);
+    while pair.time < deadline && pair.path_stats(Client, PathId::ZERO).unwrap().pto_count < 3 {
+        assert!(
+            pair.step(),
+            "native loss detection stopped before the selected path failed"
+        );
+    }
+    assert!(pair.path_stats(Client, PathId::ZERO).unwrap().pto_count >= 3);
+    let client_after = pair.path_stats(Client, backup).unwrap();
+    let server_after = pair.path_stats(Server, backup).unwrap();
+    assert!(server_after.frame_rx.ping > server_before.frame_rx.ping);
+    assert_eq!(
+        client_after.pto_count, 0,
+        "a working Backup must ACK its probes while the selected path is blackholed"
+    );
+    assert_eq!(server_after.pto_count, 0);
+    assert!(client_after.frame_rx.path_acks > client_before.frame_rx.path_acks);
+    assert_eq!(
+        client_after.frame_tx.stream, client_before.frame_tx.stream,
+        "control responsiveness cannot promote application data to Backup"
+    );
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), None);
+    for side in [Client, Server] {
+        assert_eq!(pair.path_status(side, PathId::ZERO)?, PathStatus::Available);
+        assert_eq!(pair.path_status(side, backup)?, PathStatus::Backup);
+    }
+    Ok(())
+}
+
+/// Bytes already sent on a lost path must migrate without replacing the Connection.
+#[test]
+fn unacknowledged_stream_survives_selected_path_loss() -> TestResult {
+    let _guard = subscribe();
+    for original_ack_first in [false, true] {
+        let mut pair = ConnPair::builder().enable_multipath().connect();
+        let routing = pair.routes.as_basic();
+        let original_client = routing.client_addr;
+        let original_server = routing.server_addr;
+        let backup_client: SocketAddr = "[::3]:4444".parse()?;
+        let backup_server: SocketAddr = "[::4]:5555".parse()?;
+        pair.routes = ManyToManyRouting::simple_symmetric(
+            [original_client, backup_client],
+            [original_server, backup_server],
+        )
+        .into();
+        let backup = pair.open_path(
+            Client,
+            FourTuple {
+                local_ip: Some(backup_client.ip()),
+                remote: backup_server,
+            },
+            PathStatus::Backup,
+        )?;
+        pair.drive();
+        assert_eq!(pair.path_status(Client, backup)?, PathStatus::Backup);
+
+        let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+        let payload = [42; 1024];
+        pair.send_stream(Client, stream).write(&payload)?;
+        pair.send_stream(Client, stream).finish()?;
+        // Hold the original STREAM packet so its ACK can arrive in either order.
+        pair.drive_client();
+        let original_packets: Vec<_> = pair.server.inbound.drain().collect();
+        assert!(!original_packets.is_empty());
+        let sent_stream_frames = pair.stats(Client).frame_tx.stream;
+        assert!(sent_stream_frames > 0);
+        let deadline = pair.time + Duration::from_secs(15);
+        while pair.time < deadline && pair.path_stats(Client, PathId::ZERO).unwrap().pto_count < 3 {
+            assert!(pair.blackhole_step(true, true));
+        }
+        assert!(pair.path_stats(Client, PathId::ZERO).unwrap().pto_count >= 3);
+        // Only the alternative physical route returns. The original tuple stays blackholed.
+        pair.routes = ManyToManyRouting::simple_symmetric([backup_client], [backup_server]).into();
+        pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+        pair.set_path_status(Client, backup, PathStatus::Available)?;
+        pair.set_path_status(Server, PathId::ZERO, PathStatus::Backup)?;
+        pair.set_path_status(Server, backup, PathStatus::Available)?;
+        if original_ack_first {
+            // Drop the first retransmission, then deliver the delayed original. Its
+            // ACK must not strand the bytes or FIN now carried by the backup path.
+            while pair.time < deadline && pair.stats(Client).frame_tx.stream == sent_stream_frames {
+                assert!(pair.blackhole_step(true, true));
+            }
+            assert!(pair.stats(Client).frame_tx.stream > sent_stream_frames);
+        } else {
+            pair.drive();
+            assert_eq!(pair.streams(Client).send_streams(), 0);
+        }
+        pair.routes = ManyToManyRouting::simple_symmetric(
+            [original_client, backup_client],
+            [original_server, backup_server],
+        )
+        .into();
+        for (_, packet) in original_packets {
+            let now = pair.time;
+            pair.server.inbound.push(now, packet);
+        }
+        pair.drive();
+        assert_eq!(pair.streams(Client).send_streams(), 0);
+        let mut finished = 0;
+        while let Some(event) = pair.poll(Client) {
+            if matches!(event, Event::Stream(StreamEvent::Finished { id }) if id == stream) {
+                finished += 1;
+            }
+        }
+        assert_eq!(finished, 1);
+        assert!(!pair.is_closed(Client));
+        assert!(!pair.is_closed(Server));
+        assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+        let mut received = Vec::new();
+        let mut recv = pair.recv_stream(Server, stream);
+        let mut chunks = recv.read(false)?;
+        while let Some(chunk) = chunks.next(usize::MAX)? {
+            received.extend_from_slice(&chunk.bytes);
+        }
+        let _ = chunks.finalize();
+        assert_eq!(received, payload);
+    }
+    Ok(())
+}
