@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
+use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -346,14 +346,10 @@ impl EndpointFactory {
         let span = info_span!("dummy");
         span.record("otel.name", name.into());
         let _guard = span.entered();
-        let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
         let transport_config = Arc::new(transport_config);
-        let mut server_config =
-            crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap();
+        let mut server_config = self.server_config();
         server_config.transport_config(transport_config.clone());
 
-        let mut roots = RootCertStore::empty();
-        roots.add(self.cert.cert.der().clone()).unwrap();
         let endpoint = Endpoint::new(
             self.endpoint_config.clone(),
             Some(server_config),
@@ -361,11 +357,38 @@ impl EndpointFactory {
             runtime,
         )
         .unwrap();
-        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut client_config = self.client_config();
         client_config.transport_config(transport_config);
         endpoint.set_default_client_config(client_config);
 
         endpoint
+    }
+
+    /// A client-only endpoint on `socket`, trusting this factory's certificate
+    fn endpoint_with_socket(&self, name: impl Into<String>, socket: UdpSocket) -> Endpoint {
+        let span = info_span!("dummy");
+        span.record("otel.name", name.into());
+        let _guard = span.entered();
+        let endpoint = Endpoint::new(
+            self.endpoint_config.clone(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(self.client_config());
+        endpoint
+    }
+
+    fn server_config(&self) -> crate::ServerConfig {
+        let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
+        crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap()
+    }
+
+    fn client_config(&self) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.cert.cert.der().clone()).unwrap();
+        ClientConfig::with_root_certificates(Arc::new(roots)).unwrap()
     }
 }
 
@@ -1947,4 +1970,57 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
     fn now(&self) -> Instant {
         TokioRuntime.now()
     }
+}
+
+/// An endpoint with an IPv4 and an IPv6 socket serves clients on both.
+///
+/// The IPv6 socket puts the endpoint in IPv6 mode, so the IPv4 socket exercises the address
+/// mapping on receive and the reverse mapping in the routing sender.
+#[tokio::test]
+async fn multiple_sockets() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let v4 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let v6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
+    let addrs = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
+    let runtime = TokioRuntime;
+    let server = Endpoint::new_with_abstract_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![
+            runtime.wrap_udp_socket(v4).unwrap(),
+            runtime.wrap_udp_socket(v6).unwrap(),
+        ],
+        Arc::new(runtime),
+    )
+    .unwrap();
+    assert_eq!(server.local_addr().unwrap(), addrs[0]);
+
+    const MSG: &[u8] = b"hello";
+    let accept = tokio::spawn({
+        let server = server.clone();
+        async move {
+            for _ in 0..2 {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let mut stream = conn.open_uni().await.unwrap();
+                stream.write_all(MSG).await.unwrap();
+                stream.finish().unwrap();
+                _ = stream.stopped().await;
+            }
+        }
+    });
+
+    for addr in addrs {
+        let client = factory.endpoint_with_socket(
+            "client",
+            UdpSocket::bind(SocketAddr::new(addr.ip(), 0)).unwrap(),
+        );
+        let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+        let mut stream = conn.accept_uni().await.unwrap();
+        assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+        conn.close(0u32.into(), b"done");
+    }
+    accept.await.unwrap();
+    server.close(0u32.into(), b"done");
+    server.wait_idle().await;
 }

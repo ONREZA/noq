@@ -1566,8 +1566,11 @@ pub(crate) struct State {
     sender: Pin<Box<dyn UdpSender>>,
     pub(crate) runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
-    /// We buffer a transmit when the underlying I/O would block
-    buffered_transmit: Option<proto::Transmit>,
+    /// Transmits whose socket would block, each with its datagram bytes
+    ///
+    /// While a destination is in here, `poll_transmit_filtered` skips it, so paths on other
+    /// sockets keep sending. Retried in order on the next drive.
+    blocked_transmits: Vec<(proto::Transmit, Vec<u8>)>,
     /// Our last external address reported by the peer. When multipath is enabled, this will be the
     /// last report across all paths.
     pub(crate) observed_external_addr: watch::Sender<Option<SocketAddr>>,
@@ -1607,7 +1610,7 @@ impl State {
             sender,
             runtime,
             send_buffer: Vec::new(),
-            buffered_transmit: None,
+            blocked_transmits: Vec::new(),
             path_events: tokio::sync::broadcast::channel(32).0,
             observed_external_addr: watch::Sender::new(None),
             nat_traversal_updates: tokio::sync::broadcast::channel(32).0,
@@ -1626,26 +1629,36 @@ impl State {
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
-        loop {
-            // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
-                Some(t) => t,
-                None => {
-                    self.send_buffer.clear();
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
-                        Some(t) => {
-                            transmits += match t.segment_size {
-                                None => 1,
-                                Some(s) => t.size.div_ceil(s), // round up
-                            };
-                            t
-                        }
-                        None => break,
-                    }
+        // Retry blocked transmits first, so each destination keeps its order.
+        let mut i = 0;
+        while let Some((t, data)) = self.blocked_transmits.get(i) {
+            match self
+                .sender
+                .as_mut()
+                .poll_send(&udp_transmit(t, &data[..t.size]), cx)
+            {
+                Poll::Pending => i += 1,
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(())) => {
+                    drop(self.blocked_transmits.remove(i));
                 }
+            }
+        }
+
+        loop {
+            self.send_buffer.clear();
+            let blocked = &self.blocked_transmits;
+            let Some(t) = self.inner.poll_transmit_filtered(
+                now,
+                max_datagrams,
+                &mut self.send_buffer,
+                &mut |destination| !blocked.iter().any(|(t, _)| t.destination == destination),
+            ) else {
+                break;
+            };
+            transmits += match t.segment_size {
+                None => 1,
+                Some(s) => t.size.div_ceil(s), // round up
             };
 
             let len = t.size;
@@ -1655,8 +1668,11 @@ impl State {
                 .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
                 Poll::Pending => {
-                    self.buffered_transmit = Some(t);
-                    return Ok(false);
+                    let data = std::mem::take(&mut self.send_buffer);
+                    self.blocked_transmits.push((t, data));
+                    if self.blocked_transmits.len() >= MAX_BLOCKED_TRANSMITS {
+                        return Ok(false);
+                    }
                 }
                 Poll::Ready(Err(e)) => return Err(e),
                 Poll::Ready(Ok(())) => {}
@@ -2028,6 +2044,13 @@ pub enum SendDatagramError {
 /// This limits the amount of CPU resources consumed by datagram generation,
 /// and allows other tasks (like receiving ACKs) to run in between.
 const MAX_TRANSMIT_DATAGRAMS: usize = 20;
+
+/// Maximum number of transmits held back because their socket would block.
+///
+/// Each blocked destination is skipped by `poll_transmit_filtered`, so this bounds the work
+/// and memory a connection spends on sockets that are not ready. Once reached, the
+/// connection waits for the sockets, as it always did with a single socket.
+const MAX_BLOCKED_TRANSMITS: usize = 8;
 
 /// The maximum amount of datagrams that are sent in a single transmit
 ///
