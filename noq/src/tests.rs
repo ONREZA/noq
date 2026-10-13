@@ -2024,3 +2024,128 @@ async fn multiple_sockets() {
     server.close(0u32.into(), b"done");
     server.wait_idle().await;
 }
+
+/// A socket wrapper whose `poll_recv` fails once told to.
+#[derive(Debug)]
+struct FailingSocket {
+    inner: Box<dyn AsyncUdpSocket>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncUdpSocket for FailingSocket {
+    fn create_sender(&self) -> Pin<Box<dyn crate::UdpSender>> {
+        self.inner.create_sender()
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(io::Error::other("test failure")));
+        }
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Binds a loopback socket, wrapped so the test can make it fail.
+fn failing_socket() -> (Box<dyn AsyncUdpSocket>, Arc<std::sync::atomic::AtomicBool>) {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let socket = FailingSocket {
+        inner: TokioRuntime.wrap_udp_socket(socket).unwrap(),
+        fail: fail.clone(),
+    };
+    (Box::new(socket), fail)
+}
+
+/// A failing socket is removed and the endpoint keeps serving on the other one.
+#[tokio::test]
+async fn failing_socket_is_removed() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let (bad, fail) = failing_socket();
+    let good = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let good_addr = good.local_addr().unwrap();
+    let server = Endpoint::new_with_abstract_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![bad, TokioRuntime.wrap_udp_socket(good).unwrap()],
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let bad_addr = server.local_addr().unwrap();
+
+    // Fail the first socket by sending it a datagram, so its receive task runs into the error.
+    fail.store(true, Ordering::SeqCst);
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .unwrap()
+        .send_to(b"x", bad_addr)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.local_addr().unwrap() != good_addr {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed socket was not removed");
+
+    const MSG: &[u8] = b"hello";
+    let accept = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut stream = conn.open_uni().await.unwrap();
+            stream.write_all(MSG).await.unwrap();
+            stream.finish().unwrap();
+            _ = stream.stopped().await;
+        }
+    });
+    let client = factory.endpoint_with_socket(
+        "client",
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+    );
+    let conn = client
+        .connect(good_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut stream = conn.accept_uni().await.unwrap();
+    assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+    conn.close(0u32.into(), b"done");
+    accept.await.unwrap();
+}
+
+/// When the last socket fails the endpoint stops, as a single-socket endpoint always did.
+#[tokio::test]
+async fn last_socket_failure_stops_endpoint() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let (bad, fail) = failing_socket();
+    let server = Endpoint::new_with_abstract_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![bad],
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    fail.store(true, Ordering::SeqCst);
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .unwrap()
+        .send_to(b"x", addr)
+        .unwrap();
+    let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept())
+        .await
+        .expect("endpoint did not stop");
+    assert!(
+        accepted.is_none(),
+        "accept should end when the driver stops"
+    );
+}

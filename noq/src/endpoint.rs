@@ -179,6 +179,12 @@ impl Endpoint {
     ///
     /// If any socket is IPv6, the endpoint represents every remote address as IPv6. IPv4 sockets
     /// then see IPv4-mapped addresses from the endpoint and get plain IPv4 destinations on send.
+    ///
+    /// A socket whose `poll_recv` returns an error is removed from the endpoint and closed.
+    /// Connections keep running over the remaining sockets. When the last socket fails, the
+    /// endpoint stops with that error, as a single-socket endpoint always did. Sockets should
+    /// therefore handle errors they consider transient themselves and only return the ones they
+    /// consider final.
     pub fn new_with_abstract_sockets(
         config: EndpointConfig,
         server_config: Option<ServerConfig>,
@@ -1109,15 +1115,28 @@ impl SocketDriver {
             .spawn(Box::pin(driver.instrument(Span::current())));
     }
 
-    /// Reports a receive error, which ends the endpoint unless the socket is already retired
+    /// Reports a receive error
+    ///
+    /// Removes the socket from the endpoint. If it was the last one, the endpoint ends with the
+    /// error instead. A socket that was already retired by a rebind is simply dropped.
     fn fail(&self, e: io::Error) {
         let mut state = self.endpoint.state.lock().unwrap();
         if !state.is_current(&self.socket) {
             return;
         }
-        state.io_error = Some(e);
-        if let Some(driver) = state.driver.take() {
-            driver.wake();
+        if state.sockets.len() == 1 {
+            state.io_error = Some(e);
+            if let Some(driver) = state.driver.take() {
+                driver.wake();
+            }
+            return;
+        }
+        tracing::warn!(error = %e, "socket failed to receive, removing it from the endpoint");
+        state.sockets.retain(|s| !Arc::ptr_eq(s, &self.socket));
+        state.sender = state.create_sender();
+        for sender in state.recv_state.connections.senders.values() {
+            // Ignoring errors from dropped connections
+            let _ = sender.send(ConnectionEvent::ReplaceSender(state.create_sender()));
         }
     }
 }

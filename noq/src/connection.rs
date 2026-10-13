@@ -18,7 +18,7 @@ use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot, watch};
-use tracing::{Instrument, Span, debug_span};
+use tracing::{Instrument, Span, debug_span, trace};
 
 use crate::{
     ConnectionEvent, Duration, Instant, Path, VarInt,
@@ -1670,8 +1670,11 @@ impl State {
                 Poll::Pending => {
                     let data = std::mem::take(&mut self.send_buffer);
                     self.blocked_transmits.push((t, data));
-                    if self.blocked_transmits.len() >= MAX_BLOCKED_TRANSMITS {
-                        return Ok(false);
+                    if self.blocked_transmits.len() > MAX_BLOCKED_TRANSMITS {
+                        // A socket that stays blocked must not stall the connection or hold
+                        // memory without bound. Count the oldest as lost, like a failed send.
+                        let (t, _) = self.blocked_transmits.remove(0);
+                        trace!(destination = %t.destination, "dropping oldest blocked transmit");
                     }
                 }
                 Poll::Ready(Err(e)) => return Err(e),
@@ -1708,6 +1711,9 @@ impl State {
                 Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
                     self.sender = sender;
                     self.inner.handle_network_change(None, self.runtime.now());
+                }
+                Poll::Ready(Some(ConnectionEvent::ReplaceSender(sender))) => {
+                    self.sender = sender;
                 }
                 Poll::Ready(Some(ConnectionEvent::LocalAddressChanged(hint))) => {
                     self.inner
@@ -2048,8 +2054,8 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// Maximum number of transmits held back because their socket would block.
 ///
 /// Each blocked destination is skipped by `poll_transmit_filtered`, so this bounds the work
-/// and memory a connection spends on sockets that are not ready. Once reached, the
-/// connection waits for the sockets, as it always did with a single socket.
+/// and memory a connection spends on sockets that are not ready. Beyond it, the oldest
+/// blocked transmit is dropped and left to loss recovery.
 const MAX_BLOCKED_TRANSMITS: usize = 8;
 
 /// The maximum amount of datagrams that are sent in a single transmit
