@@ -217,6 +217,11 @@ impl core::fmt::Debug for FrameStats {
 pub struct PathStats {
     /// Current best estimate of this connection's latency (round-trip-time).
     pub rtt: Duration,
+    /// Consecutive probe timeouts without an acknowledgement on this path.
+    ///
+    /// A valid ACK resets this counter; unlike cumulative loss statistics it
+    /// describes current responsiveness rather than historical packet loss.
+    pub pto_count: u32,
     /// Statistics about datagrams and bytes sent on this path.
     pub udp_tx: UdpStats,
     /// Statistics about datagrams and bytes received on this path.
@@ -327,6 +332,7 @@ impl core::ops::Add<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            pto_count: _,
             udp_tx,
             udp_rx,
             frame_tx,
@@ -365,6 +371,7 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
         // rtt, cwnd and current_mtu fields.
         let PathStats {
             rtt: _,
+            pto_count: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,
